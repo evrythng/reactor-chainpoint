@@ -1,6 +1,6 @@
-# blockchainActionsVerifier
+# ReactorChainPoint
 
-A Reactor script to verify Actions on the blockchain via the chainPoint protocol and the Tierion API.
+A Reactor script to verify EVRYTHNG Actions on the blockchain via the chainPoint protocol and the Tierion API.
 
 
 ## Configure
