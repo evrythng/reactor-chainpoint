@@ -1,118 +1,104 @@
-var createHash = require('sha.js'),
-  hashclient = require('hashapi-lib-node');
+const createHash = require('sha.js');
+const HashClient = require('hashapi-lib-node');
 
-var sha256 = createHash('sha256');
-const username = CONFIGURE_ME;
-const password = CONFIGURE_ME;
-const validationActionType = '_blockchainValidated';
-const validationProcessingTime = 3600000; // 1 hour
+const USERNAME = '';
+const PASSWORD = '';
+const ACTION_TYPE_VALIDATION = '_blockchainValidated';
+const VALIDATION_WAIT_MS = 1 * 60 * 60 * 1000;  // 1 hour
+
+const hashClient = new HashClient();
+const sha256 = createHash('sha256');
+
+const promiseCb = (err, result, resolve, reject) => {
+  if (err) {
+    reject(err);
+    return;
+  }
+
+  resolve(result);
+};
+
+const authenticate = () => new Promise((resolve, reject) => {
+  hashClient.authenticate(USERNAME, PASSWORD, (err, res) => promiseCb(err, res, resolve, reject));
+});
+
+const getReceipt = arg => new Promise((resolve, reject) => {
+  hashClient.getReceipt(arg, (err, res) => promiseCb(err, res, resolve, reject));
+});
+
+const submitHashItem = arg => new Promise((resolve, reject) => {
+  hashClient.submitHashItem(arg, (err, res) => promiseCb(err, res, resolve, reject));
+});
 
 /**
- * This creates a timestamped blockchain proof of and Action
- * when the blockchainValidate customField is true.
+ * This creates a timestamped blockchain proof of an Action when the blockchainValidate
+ * customField is true.
  */
+const submitHashToBlockchain = (action) => {
+  const hash = sha256.update(JSON.stringify(action), 'utf8').digest('hex');
+  logger.debug(`Action SHA256: ${hash}`);
+
+  return submitHashItem(hash).then((result) => {
+    const receipt = result.receiptId;
+
+    // Set the receipt ID
+    app.thng(action.thng).property('receiptid').update(receipt);
+
+    // Schedule reactor check in 1 hour
+    const event = { receipt, action: action.id, thng: action.thng };
+    logger.debug(`event: ${JSON.stringify(event)}`);
+    return app.reactor.schedule().create({
+      event,
+      executeAt: Date.now() + VALIDATION_WAIT_MS,
+      description: 'Initial check for blockchain trx',
+    });
+  });
+};
+
+/**
+ * Retrieve the blockchain transaction, if it has been processed.
+ *
+ * This is triggered on a schedule to retrieve confirmed Actions from the blockchain.
+ * Will receive: event: { receipt, action, thng }
+ */
+const createValidationAction = event => getReceipt(event.receipt).then((transaction) => {
+  logger.info(`Blockchain transaction: ${JSON.stringify(transaction)}`);
+  const receiptObj = JSON.parse(transaction.receipt);
+
+  return app.action(ACTION_TYPE_VALIDATION).create({
+    thng: event.thng,
+    customFields: {
+      actionId: event.action,
+      bitcoinTrxId: receiptObj.anchors[0].sourceId,
+      receiptId: event.receipt,
+      fullReceipt: transaction,
+    },
+  });
+});
+
+const handleError = err => logger.error(err.message ? err.message : JSON.stringify(err));
+
 // @filter(onActionCreated) action.customFields.blockchainValidate=true
 function onActionCreated(event) {
-  logger.info('Blockchain validation for Action requested!');
-  var hashClient = new hashclient();
-  hashClient.authenticate(username, password, function (err, authToken) {
-    if (err) {
-      logger.error(err);
-      done();
-    } else {
-      logger.debug('Authentication to Blockchain API successful!');
-      var h = sha256.update(JSON.stringify(event.action), 'utf8').digest('hex');
-      logger.debug('Action SHA256: ' + h);
+  logger.info('Blockchain validation for action requested!');
 
-      hashClient.submitHashItem(h, function (err, result) {
-        if (err) {
-          logger.error('Error while submitting to the blockchain --');
-          logger.error(err);
-          done();
-        } else {
-          const receipt = result.receiptId;
-          logger.info('Got a blockchain receipt: ' + receipt);
-          app.thng(event.action.thng).property('receiptid').update(receipt);
-          // schedule reactor check in 1 hour
-          app.reactor.schedule().create(createSchedule(receipt, event.action.id, event.action.thng, validationProcessingTime, "Initial check for blockchain trx")).then((schedule) => {
-            logger.debug('Reactor scheduled to query blockchain at: ' + schedule.executeAt);
-            logger.debug(JSON.stringify(schedule));
-            done();
-          }, (err) =>  {
-            logger.error("Error when scheduling reactor script --");
-            logger.error(JSON.stringify(err));
-            done();
-          });
-        }
-      });
-    }
-  });
+  authenticate()
+    .then(() => submitHashToBlockchain(event.action))
+    .then(schedule => logger.info(`Reactor scheduled for ${schedule.executeAt}`))
+    .catch(handleError)
+    .then(done);
 }
 
-
-/**
- * This is triggered on a schedule to retrieve confirmed Actions
- * from the blockchain.
- * Will receive:  {"receipt": receipt, "action" : event.action.id, "thng" : event.action.thng}
- */
 function onScheduledEvent(event) {
-  logger.info('Checking for confirmed Actions on Blockchain...');
-  var hashClient = new hashclient();
-  hashClient.authenticate(username, password, function (err, authToken) {
-    if (err) {
-      logger.error(JSON.stringify(err));
-      done();
-    } else {
-      logger.debug('Authentication successful!');
-      // retrieve the blockchain transaction - if it has been processed...
-      hashClient.getReceipt(event.receipt, function (err, transaction) {
-        if (err) {
-          // error or the transaction hasn't been recorded yet
-          logger.error("Transaction not found or hasn't been recorded --");
-          logger.error(JSON.stringify(err));
-          done();
-        } else {
-          // process transaction result
-          logger.debug('Blockchain transaction found --');
-          const receiptObj = JSON.parse(transaction.receipt);
-          logger.debug(JSON.stringify(receiptObj));
-          app.action(validationActionType).create({
-            thng: event.thng,
-            customFields: {"actionId" : event.action, "bitcoinTrxId": receiptObj.anchors[0].sourceId,
-              "receiptId" : event.receipt, "fullReceipt" : transaction}
-          }).then((action) => {
-            logger.debug('Created ' + validationActionType + ' Action --');
-            logger.debug(JSON.stringify(action));
-            done();
-          });
-        }
-      });
-    }
-  });
+  logger.info('Checking for confirmed actions on blockchain...');
+
+  authenticate()
+    .then(() => createValidationAction(event))
+    .then(action => logger.info(`Created ${ACTION_TYPE_VALIDATION} action: ${action.id}`))
+    .catch(handleError)
+    .then(done);
 }
 
-/**
- * Returns a configuration object for the reactor scheduler.
- * @param receiptId the blockchain receipt identifier
- * @param actionId identifier of the Action that was verified
- * @param thngId identifier of the Thng the Action was performed on
- * @param execInMillisec time of execution
- * @oaran description
- * @returns {{function: string, event: {receipt: *, action: *, thng: *}, executeAt: *, description: string, enabled: boolean}}
- */
-function createSchedule(receiptId, actionId, thngId, execInMillisec, description) {
-  const exec = Date.now() + execInMillisec;
-  const schedule = {
-    "function": "onScheduledEvent",
-    "event": {"receipt": receiptId, "action": actionId, "thng": thngId},
-    "executeAt": exec,
-    "description": description,
-    "enabled": true
-  };
-  logger.debug('Should execute at: ' + exec);
-  logger.debug(JSON.stringify(schedule));
-  return schedule;
-}
 
 /////////////////////////////////////////
 // For local tests - REMOVE FOR REACTOR!
@@ -120,50 +106,57 @@ function createSchedule(receiptId, actionId, thngId, execInMillisec, description
 
 /*
 function done() {};
-var EVT = require('evrythng-extended');
-var app = new EVT.TrustedApp(CONFIGURE_ME);
-const  actionEvent = {"action" : {
-  "id": "UnBggUASBg8RQKwwwDPy4xcn",
-  "createdAt": 1518010274723,
-  "customFields": {
-    "blockchainValidate": true,
-    "retailer": "SportsDirect"
-  },
-  "tags": [
-    "test"
-  ],
-  "timestamp": 1518010274723,
-  "type": "_toRetailer",
-  "location": {
-    "latitude": 51.515172199999995,
-    "longitude": -0.0498457,
-    "position": {
-      "type": "Point",
-      "coordinates": [
-        -0.0498457,
-        51.515172199999995
-      ]
-    }
-  },
-  "locationSource": "sensor",
-  "context": {
-    "ipAddress": "141.0.154.202",
-    "city": "City of London",
-    "region": "England",
-    "countryCode": "GB",
-    "userAgentName": "",
-    "operatingSystemName": "",
-    "timeZone": "Europe/London"
-  },
-  "createdByProject": "U2Ms4GXYMGPYhMawaDdefBpd",
-  "createdByApp": "UFMPn3ECqG8hhMwRa2aM7Mhf",
-  "identifiers": {},
-  "thng": "UFq8n4yUMGshEMRwwkQE3bam",
-  "product": "UkM8nmtCeXsa9pRaRhqQUcen"
-}};
+const EVT = require('evrythng-extended');
+const app = new EVT.TrustedApp('');
 logger = console;
 logger.debug = logger.info;
 
-onScheduledEvent({"receipt": "5a8422c3e4a70229ae335c06", "thng": "UFq8n4yUMGshEMRwwkQE3bam", "action" : "UnBggUASBg8RQKwwwDPy4xcn"});
-//onActionCreated(actionEvent);
+const actionEvent = {
+  action: {
+    id: 'UnBggUASBg8RQKwwwDPy4xcn',
+    createdAt: 1518010274723,
+    customFields: {
+      blockchainValidate: true,
+      retailer: 'SportsDirect'
+    },
+    tags: [
+      'test'
+    ],
+    timestamp: 1518010274723,
+    type: '_toRetailer',
+    location: {
+      latitude: 51.515172199999995,
+      longitude: -0.0498457,
+      position: {
+        type: 'Point',
+        coordinates: [
+          -0.0498457,
+          51.515172199999995
+        ]
+      }
+    },
+    locationSource: 'sensor',
+    context: {
+      ipAddress: '141.0.154.202',
+      city: 'City of London',
+      region: 'England',
+      countryCode: 'GB',
+      userAgentName: '',
+      operatingSystemName: '',
+      timeZone: 'Europe/London'
+    },
+    createdByProject: 'U2Ms4GXYMGPYhMawaDdefBpd',
+    createdByApp: 'UFMPn3ECqG8hhMwRa2aM7Mhf',
+    identifiers: {},
+    thng: 'UFq8n4yUMGshEMRwwkQE3bam',
+    product: 'UkM8nmtCeXsa9pRaRhqQUcen'
+  }
+}};
+
+// onScheduledEvent({
+//   receipt: '5a8422c3e4a70229ae335c06',
+//   thng: 'UFq8n4yUMGshEMRwwkQE3bam',
+//   action: 'UnBggUASBg8RQKwwwDPy4xcn'
+// });
+// onActionCreated(actionEvent);
 */
