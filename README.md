@@ -1,6 +1,6 @@
 # reactor-chainpoint
 
-A Reactor script to verify EVRYTHNG Actions on the blockchain via the chainPoint protocol and the Tierion API.
+This Reactor Extension script is part of [EVRYTHNG's Blockchain Integration Hub](https://developers.evrythng.com/docs/blockchain-integration-hub). It allows you to verify EVRYTHNG Actions on the blockchain via the chainPoint protocol and the Tierion API.
 
 ## Full tutorial
 
